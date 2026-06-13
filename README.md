@@ -167,15 +167,17 @@ Contributions are welcome! Feel free to open issues or submit pull requests.
 
 ## Security
 
-If you discover a security vulnerability, please report it responsibly. Do **not** open a public issue for security vulnerabilities.
+If you discover a security vulnerability, please report it responsibly. Please do not open a public issue for security-related vulnerabilities.
 
-Instead, please email: [your-email@example.com](mailto:your-email@example.com)
+Instead, report it privately via email:
 
-Security best practices:
+Email: [roysetiono25@gmail.com](mailto:roysetiono25@gmail.com)
 
-- Change default AP password before deployment
-- Use WPA2 for WiFi connections
-- Keep firmware updated
+### Security Best Practices
+
+- Change the default AP password before deployment
+- Use WPA2 or stronger encryption for WiFi connections
+- Keep the firmware updated
 
 ## License
 
