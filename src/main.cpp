@@ -31,7 +31,7 @@
 httpServer_t *httpServer = NULL;
 
 // Include oscilloscope
-// #define USE_I2S_INTERFACE             
+#define USE_I2S_INTERFACE             
 #include "oscilloscope.h"
 
 #ifdef USE_FILE_SYSTEM

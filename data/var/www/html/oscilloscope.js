@@ -2,7 +2,8 @@
 var invalidDigitalInputs = "25,32,33,34";
 
 // ----- DEFINE INVALID ANALOG INPUT GPIOs FOR YOUR PROJECT/BOARD HERE -----
-var invalidAnalogInputs = "4,16";
+// GPIO 4, 0, 2, 15, 13, 12, 14, 27, 25, 26 = ADC2 (tidak bisa digunakan bersamaan dengan WiFi)
+var invalidAnalogInputs = "0,2,4,12,13,14,15,25,26,27,34";
 
 // getCookie, sertCookie from: https://www.w3schools.com/js/js_cookies.asp
 function getCookie(cname) {

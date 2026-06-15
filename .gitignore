@@ -3,3 +3,6 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Jangan commit credentials WiFi - edit langsung di server_config.h
+include/server_config.h

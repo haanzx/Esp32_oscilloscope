@@ -22,10 +22,14 @@
 #include <ostream.hpp>
 #include <Cstring.hpp>
 #include <httpServer.h>
+#include <freertos/semphr.h>
 
 
 #ifndef __OSCILLOSCOPE__
   #define __OSCILLOSCOPE__
+
+    // Mutex untuk melindungi akses sendBuffer antara oscReader dan oscSender
+    static SemaphoreHandle_t __osc_sendbuffer_mutex__ = NULL;
 
     // #define __OSCILLOSCOPE_H_DEBUG__        // uncomment this line for debugging puroposes
     #ifdef __OSCILLOSCOPE_H_DEBUG__
@@ -96,7 +100,7 @@
             osc2SignalsSample   samples2Signals   [OSCILLOSCOPE_2SIGNALS_BUFFER_SIZE];
         };
         unsigned int sampleCount;               // number of samples in the buffer
-        bool samplesAreReady;                   // is the buffer ready for sending
+        volatile bool samplesAreReady;          // is the buffer ready for sending (volatile untuk cross-core visibility)
     };
 
     enum readerState { INITIAL = 0, START = 1, STARTED = 2, STOP = 3, STOPPED = 4 };
@@ -200,6 +204,7 @@
         int noOfSamplesPerScreen = screenWidthTime / samplingTime; if (noOfSamplesPerScreen * samplingTime < screenWidthTime) noOfSamplesPerScreen ++;
         unsigned long correctedScreenWidthTime = noOfSamplesPerScreen * samplingTime;                         
         screenRefreshMilliseconds = correctedScreenWidthTime >= 50000 ? correctedScreenWidthTime / 1000 : ((50500 / correctedScreenWidthTime) * correctedScreenWidthTime) / 1000;
+        if (screenRefreshMilliseconds < 30) screenRefreshMilliseconds = 30; // minimum 30 ms (~33 fps) untuk mencegah WebSocket overload
         __oscilloscope_h_debug__ ("oscReader_millis: samplingTime = " + String (samplingTime) + ", screenWidthTime = " + String (screenWidthTime));
 
         // determine mode of operation sample at a time or screen at a time - this only makes sense when screenWidthTime is measured in ms
@@ -305,9 +310,12 @@
                     // copy read buffer to send buffer so that oscilloscope sender can send it to javascript client 
 
                     while (oneSampleAtATime && sendBuffer->samplesAreReady) vTaskDelay (pdMS_TO_TICKS (1)); // in oneSampleAtATime mode wait until previous frame is sent
-                    if (!sendBuffer->samplesAreReady) 
-                        *sendBuffer = *readBuffer; // this also copies 'ready' flag from read buffer which is 'true' - tell oscSender to send the packet, this would refresh client screen
-                    // else send buffer with previous frame is still waiting to be sent, do nothing now, skip this frame
+                    if (xSemaphoreTake (__osc_sendbuffer_mutex__, pdMS_TO_TICKS (1)) == pdTRUE) {
+                        if (!sendBuffer->samplesAreReady) 
+                            *sendBuffer = *readBuffer; // this also copies 'ready' flag from read buffer which is 'true' - tell oscSender to send the packet, this would refresh client screen
+                        // else send buffer with previous frame is still waiting to be sent, do nothing now, skip this frame
+                        xSemaphoreGive (__osc_sendbuffer_mutex__);
+                    }
 
                     // break out of the loop and than start taking new samples
                     break; // get out of while loop to start sampling from the left of the screen again
@@ -316,11 +324,14 @@
                 // one sample at a time mode requires sending (copying) the readBuffer to the sendBuffer so it can be sent to the javascript client even before it gets full (of samples that fit to one screen)
                 if (oneSampleAtATime && readBuffer->sampleCount) {
                     // copy read buffer to send buffer so that oscilloscope sender can send it to javascript client 
-                    if (!sendBuffer->samplesAreReady) {
-                        *sendBuffer = *readBuffer; // this also copies 'ready' flag from read buffer which is 'true' - tell oscSender to send the packet, this would refresh client screen
-                        readBuffer->sampleCount = 0; // empty read buffer so we don't send the same data again later
+                    if (xSemaphoreTake (__osc_sendbuffer_mutex__, pdMS_TO_TICKS (1)) == pdTRUE) {
+                        if (!sendBuffer->samplesAreReady) {
+                            *sendBuffer = *readBuffer; // this also copies 'ready' flag from read buffer which is 'true' - tell oscSender to send the packet, this would refresh client screen
+                            readBuffer->sampleCount = 0; // empty read buffer so we don't send the same data again later
+                        }
+                        // else send buffer with previous frame is still waiting to be sent, but the buffer is not full yet, so just continue sampling into the same frame
+                        xSemaphoreGive (__osc_sendbuffer_mutex__);
                     }
-                    // else send buffer with previous frame is still waiting to be sent, but the buffer is not full yet, so just continue sampling into the same frame
                 }
     
                 // take the next sample
@@ -331,15 +342,15 @@
 
                 #ifdef INVERT_ADC1_GET_RAW
                     if (noOfSignals == 1) { if (doAnalogRead) new1SignalSample = {(int16_t) (~adc1_get_raw (adcchannel1) & 0xFFF), (int16_t) deltaTime}; else new1SignalSample = {(int16_t) gpio_hal_get_level (&__gpio_hal__, gpio1), (int16_t) deltaTime}; 
-                                            readBuffer->samples1Signal [readBuffer->sampleCount ++] = new1SignalSample;
+                                            if (readBuffer->sampleCount < OSCILLOSCOPE_1SIGNAL_BUFFER_SIZE) readBuffer->samples1Signal [readBuffer->sampleCount ++] = new1SignalSample;
                     } else                { if (doAnalogRead) new2SignalsSample = {(int16_t) (~adc1_get_raw (adcchannel1) & 0xFFF), (int16_t) (~adc1_get_raw (adcchannel2) & 0xFFF), (int16_t) deltaTime}; else new2SignalsSample = {(int16_t) gpio_hal_get_level (&__gpio_hal__, gpio1), (int16_t) gpio_hal_get_level (&__gpio_hal__, gpio2), (int16_t) deltaTime}; 
-                                            readBuffer->samples2Signals [readBuffer->sampleCount ++] = new2SignalsSample;
+                                            if (readBuffer->sampleCount < OSCILLOSCOPE_2SIGNALS_BUFFER_SIZE) readBuffer->samples2Signals [readBuffer->sampleCount ++] = new2SignalsSample;
                     }
                 #else
                     if (noOfSignals == 1) { if (doAnalogRead) new1SignalSample = {(int16_t) (adc1_get_raw (adcchannel1) & 0xFFF), (int16_t) deltaTime}; else new1SignalSample = {(int16_t) gpio_hal_get_level (&__gpio_hal__, gpio1), (int16_t) deltaTime}; 
-                                            readBuffer->samples1Signal [readBuffer->sampleCount ++] = new1SignalSample;
+                                            if (readBuffer->sampleCount < OSCILLOSCOPE_1SIGNAL_BUFFER_SIZE) readBuffer->samples1Signal [readBuffer->sampleCount ++] = new1SignalSample;
                     } else                { if (doAnalogRead) new2SignalsSample = {(int16_t) (adc1_get_raw (adcchannel1) & 0xFFF), (int16_t) (adc1_get_raw (adcchannel2) & 0xFFF), (int16_t) deltaTime}; else new2SignalsSample = {(int16_t) gpio_hal_get_level (&__gpio_hal__, gpio1), (int16_t) gpio_hal_get_level (&__gpio_hal__, gpio2), (int16_t) deltaTime}; 
-                                            readBuffer->samples2Signals [readBuffer->sampleCount ++] = new2SignalsSample;
+                                            if (readBuffer->sampleCount < OSCILLOSCOPE_2SIGNALS_BUFFER_SIZE) readBuffer->samples2Signals [readBuffer->sampleCount ++] = new2SignalsSample;
                     }
                 #endif
 
@@ -429,6 +440,7 @@
         int noOfSamplesPerScreen = screenWidthTime / samplingTime; if (noOfSamplesPerScreen * samplingTime < screenWidthTime) noOfSamplesPerScreen ++;
         unsigned long correctedScreenWidthTime = noOfSamplesPerScreen * samplingTime;                         
         screenRefreshMilliseconds = correctedScreenWidthTime >= 50000 ? correctedScreenWidthTime / 1000 : ((50500 / correctedScreenWidthTime) * correctedScreenWidthTime) / 1000;
+        if (screenRefreshMilliseconds < 30) screenRefreshMilliseconds = 30; // minimum 30 ms (~33 fps) untuk mencegah WebSocket overload
         __oscilloscope_h_debug__ ("oscReader_digital: samplingTime = " + String (samplingTime) + ", screenWidthTime = " + String (screenWidthTime));
 
         readBuffer->samplesAreReady = true; // this information will be always copied to sendBuffer together with the samples
@@ -516,9 +528,12 @@
                 if (screenTime >= screenWidthTime || (noOfSignals == 1 && readBuffer->sampleCount >= OSCILLOSCOPE_1SIGNAL_BUFFER_SIZE) || (noOfSignals == 2 && readBuffer->sampleCount >= OSCILLOSCOPE_2SIGNALS_BUFFER_SIZE)) { 
                     // copy read buffer to send buffer so that oscilloscope sender can send it to javascript client 
 
-                    if (!sendBuffer->samplesAreReady) 
-                        *sendBuffer = *readBuffer; // this also copies 'ready' flag from read buffer which is 'true' - tell oscSender to send the packet, this would refresh client screen
-                    // else send buffer with previous frame is still waiting to be sent, do nothing now, skip this frame
+                    if (xSemaphoreTake (__osc_sendbuffer_mutex__, pdMS_TO_TICKS (1)) == pdTRUE) {
+                        if (!sendBuffer->samplesAreReady) 
+                            *sendBuffer = *readBuffer; // this also copies 'ready' flag from read buffer which is 'true' - tell oscSender to send the packet, this would refresh client screen
+                        // else send buffer with previous frame is still waiting to be sent, do nothing now, skip this frame
+                        xSemaphoreGive (__osc_sendbuffer_mutex__);
+                    }
 
                     // break out of the loop and than start taking new samples
                     break; // get out of while loop to start sampling from the left of the screen again
@@ -531,9 +546,9 @@
                 };
 
                 if (noOfSignals == 1) { new1SignalSample = {(int16_t) gpio_hal_get_level (&__gpio_hal__, gpio1), (int16_t) deltaTime}; 
-                                        readBuffer->samples1Signal [readBuffer->sampleCount ++] = new1SignalSample;
+                                        if (readBuffer->sampleCount < OSCILLOSCOPE_1SIGNAL_BUFFER_SIZE) readBuffer->samples1Signal [readBuffer->sampleCount ++] = new1SignalSample;
                 } else                { new2SignalsSample = {(int16_t) gpio_hal_get_level (&__gpio_hal__, gpio1), (int16_t) gpio_hal_get_level (&__gpio_hal__, gpio2), (int16_t) deltaTime}; 
-                                        readBuffer->samples2Signals [readBuffer->sampleCount ++] = new2SignalsSample;
+                                        if (readBuffer->sampleCount < OSCILLOSCOPE_2SIGNALS_BUFFER_SIZE) readBuffer->samples2Signals [readBuffer->sampleCount ++] = new2SignalsSample;
                 }
 
                 screenTime += deltaTime;
@@ -621,6 +636,7 @@
         int noOfSamplesPerScreen = screenWidthTime / samplingTime; if (noOfSamplesPerScreen * samplingTime < screenWidthTime) noOfSamplesPerScreen ++;
         unsigned long correctedScreenWidthTime = noOfSamplesPerScreen * samplingTime;                         
         screenRefreshMilliseconds = correctedScreenWidthTime >= 50000 ? correctedScreenWidthTime / 1000 : ((50500 / correctedScreenWidthTime) * correctedScreenWidthTime) / 1000;
+        if (screenRefreshMilliseconds < 30) screenRefreshMilliseconds = 30; // minimum 30 ms (~33 fps) untuk mencegah WebSocket overload
         __oscilloscope_h_debug__ ("oscReader_analog: samplingTime = " + String (samplingTime) + ", screenWidthTime = " + String (screenWidthTime));
 
         readBuffer->samplesAreReady = true; // this information will be always copied to sendBuffer together with the samples
@@ -724,9 +740,12 @@
                 if (screenTime >= screenWidthTime || (noOfSignals == 1 && readBuffer->sampleCount >= OSCILLOSCOPE_1SIGNAL_BUFFER_SIZE) || (noOfSignals == 2 && readBuffer->sampleCount >= OSCILLOSCOPE_2SIGNALS_BUFFER_SIZE)) { 
                     // copy read buffer to send buffer so that oscilloscope sender can send it to javascript client 
 
-                    if (!sendBuffer->samplesAreReady) 
-                        *sendBuffer = *readBuffer; // this also copies 'ready' flag from read buffer which is 'true' - tell oscSender to send the packet, this would refresh client screen
-                    // else send buffer with previous frame is still waiting to be sent, do nothing now, skip this frame
+                    if (xSemaphoreTake (__osc_sendbuffer_mutex__, pdMS_TO_TICKS (1)) == pdTRUE) {
+                        if (!sendBuffer->samplesAreReady) 
+                            *sendBuffer = *readBuffer; // this also copies 'ready' flag from read buffer which is 'true' - tell oscSender to send the packet, this would refresh client screen
+                        // else send buffer with previous frame is still waiting to be sent, do nothing now, skip this frame
+                        xSemaphoreGive (__osc_sendbuffer_mutex__);
+                    }
 
                     // break out of the loop and than start taking new samples
                     break; // get out of while loop to start sampling from the left of the screen again
@@ -740,15 +759,15 @@
 
                 #ifdef INVERT_ADC1_GET_RAW
                     if (noOfSignals == 1) { new1SignalSample = {(int16_t) (~adc1_get_raw (adcchannel1) & 0xFFF), (int16_t) deltaTime}; 
-                                            readBuffer->samples1Signal [readBuffer->sampleCount ++] = new1SignalSample;
+                                            if (readBuffer->sampleCount < OSCILLOSCOPE_1SIGNAL_BUFFER_SIZE) readBuffer->samples1Signal [readBuffer->sampleCount ++] = new1SignalSample;
                     } else                { new2SignalsSample = {(int16_t) (~adc1_get_raw (adcchannel1) & 0xFFF), (int16_t) (~adc1_get_raw (adcchannel2) & 0xFFF), (int16_t) deltaTime}; 
-                                            readBuffer->samples2Signals [readBuffer->sampleCount ++] = new2SignalsSample;
+                                            if (readBuffer->sampleCount < OSCILLOSCOPE_2SIGNALS_BUFFER_SIZE) readBuffer->samples2Signals [readBuffer->sampleCount ++] = new2SignalsSample;
                     }
                 #else
                     if (noOfSignals == 1) { new1SignalSample = {(int16_t) (adc1_get_raw (adcchannel1) & 0xFFF), (int16_t) deltaTime}; 
-                                            readBuffer->samples1Signal [readBuffer->sampleCount ++] = new1SignalSample;
+                                            if (readBuffer->sampleCount < OSCILLOSCOPE_1SIGNAL_BUFFER_SIZE) readBuffer->samples1Signal [readBuffer->sampleCount ++] = new1SignalSample;
                     } else                { new2SignalsSample = {(int16_t) (adc1_get_raw (adcchannel1) & 0xFFF), (int16_t) (adc1_get_raw (adcchannel2) & 0xFFF), (int16_t) deltaTime}; 
-                                            readBuffer->samples2Signals [readBuffer->sampleCount ++] = new2SignalsSample;
+                                            if (readBuffer->sampleCount < OSCILLOSCOPE_2SIGNALS_BUFFER_SIZE) readBuffer->samples2Signals [readBuffer->sampleCount ++] = new2SignalsSample;
                     }
                 #endif
 
@@ -848,6 +867,7 @@
             int noOfSamplesPerScreen = screenWidthTime / samplingTime; if (noOfSamplesPerScreen * samplingTime < screenWidthTime) noOfSamplesPerScreen ++;
             unsigned long correctedScreenWidthTime = noOfSamplesPerScreen * samplingTime;                         
             screenRefreshMilliseconds = correctedScreenWidthTime >= 50000 ? correctedScreenWidthTime / 1000 : ((50500 / correctedScreenWidthTime) * correctedScreenWidthTime) / 1000;
+            if (screenRefreshMilliseconds < 30) screenRefreshMilliseconds = 30; // minimum 30 ms (~33 fps) untuk mencegah WebSocket overload
             __oscilloscope_h_debug__ ("oscReader_analog_1_signal_i2s: samplingTime = " + String (samplingTime) + ", screenWidthTime = " + String (screenWidthTime));
             __oscilloscope_h_debug__ ("oscReader_analog_1_signal_i2s: sampleRate = " + String (sampleRate) + ", noOfSamplesToTake = " + String (noOfSamplesToTakeFirstTime));
             __oscilloscope_h_debug__ ("oscReader_analog_1_signal_i2s: screenRefreshMilliseconds = " + String (screenRefreshMilliseconds) + " ms (should be close to 50 ms), screen refresh frequency = " + String (1000.0 / screenRefreshMilliseconds) + " Hz (should be close to 20 Hz)");
@@ -1013,8 +1033,11 @@
 
                 // pass readBuffer to oscSender
                 readBuffer->sampleCount = noOfSamplesTaken + 1; // + 1 dummy sample
-                if (!sendBuffer->samplesAreReady) 
-                    *sendBuffer = *readBuffer;
+                if (xSemaphoreTake (__osc_sendbuffer_mutex__, pdMS_TO_TICKS (1)) == pdTRUE) {
+                    if (!sendBuffer->samplesAreReady) 
+                        *sendBuffer = *readBuffer;
+                    xSemaphoreGive (__osc_sendbuffer_mutex__);
+                }
 
                 // uninstall the driver
                 i2s_driver_uninstall (I2S_NUM_0);
@@ -1048,11 +1071,19 @@
       while (true) { 
         delay (1);
         // send samples to javascript client if they are ready
-        if (sendBuffer->samplesAreReady && sendBuffer->sampleCount) {
+        bool readyToSend = false;
+        oscSamples sendSamples;
+        if (xSemaphoreTake (__osc_sendbuffer_mutex__, pdMS_TO_TICKS (1)) == pdTRUE) {
+            if (sendBuffer->samplesAreReady && sendBuffer->sampleCount) {
+                // copy buffer with samples within critical section
+                sendSamples = *sendBuffer;
+                sendBuffer->samplesAreReady = false; // oscRader will set this flag when buffer is the next time ready for sending
+                readyToSend = true;
+            }
+            xSemaphoreGive (__osc_sendbuffer_mutex__);
+        }
+        if (readyToSend) {
 
-          // copy buffer with samples within critical section
-          oscSamples sendSamples = *sendBuffer;
-          sendBuffer->samplesAreReady = false; // oscRader will set this flag when buffer is the next time ready for sending
           // swap bytes if javascript client is big endian
           int sendBytes; // calculate the number of bytes in the buffer
 
@@ -1091,6 +1122,11 @@
             return;
       }
       memset (sharedMemory, 0, sizeof (oscSharedMemory));
+
+      // Inisialisasi mutex untuk proteksi sendBuffer
+      if (__osc_sendbuffer_mutex__ == NULL) {
+          __osc_sendbuffer_mutex__ = xSemaphoreCreateMutex ();
+      }
 
       sharedMemory->webSck = webSck;                                 // put webSocket rference into shared memory
       sharedMemory->readBuffer.samplesAreReady = true;               // this value will be copied into sendBuffer later where this flag will be checked
@@ -1490,6 +1526,12 @@
 
                 // wait until oscReader STOPPED or error
                 while (sharedMemory->oscReaderState != STOPPED) delay (1); 
+      }
+
+      // Bersihkan mutex
+      if (__osc_sendbuffer_mutex__ != NULL) {
+          vSemaphoreDelete (__osc_sendbuffer_mutex__);
+          __osc_sendbuffer_mutex__ = NULL;
       }
 
       free (sharedMemory);
